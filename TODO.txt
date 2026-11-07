@@ -1,0 +1,3 @@
+search up all possible project alternatives to this one and compare performance against them.
+
+i ultimately want to make the claim that this is the most performant x11 shader renderer as a wallpaper program that exists, and make the very ambitious claim that it's basically "perfect code", meaning that it cannot be improved any further in any way.
