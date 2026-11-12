@@ -1,6 +1,6 @@
 CC = clang
 CFLAGS = -O3 -flto -Wall -Wextra
-LDLIBS = -lX11 -lXrandr -lXext -lGL -lm
+LDLIBS = -lX11 -lXrandr -lXext -lXss -lGL -lm
 PREFIX ?= /usr/local
 
 .PHONY: clean install uninstall

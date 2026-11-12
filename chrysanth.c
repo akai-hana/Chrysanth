@@ -1,17 +1,19 @@
 /* ~>[^=-| chrysanth.c >-***<> */ 
 /* X11 shader render wallpaper */
 
-/* build: make
+/* build: make   (links -lX11 -lXrandr -lXext -lXss -lGL -lm)
  * usage: chrysanth -f shader.frag [options]; (-h, --help)
  *
  * The shader is rendered directly into X11's root background's GLX pixmap.
- * Rendering pauses while an opaque window covering the whole root is fullscreen.
+ * Rendering pauses while an opaque window covering the whole root is fullscreen,
+ * while the X screensaver is on, and while DPMS has the monitor blanked.
  */
 
 #define _GNU_SOURCE
 #define GL_GLEXT_PROTOTYPES 1
 #include <ctype.h>
 #include <errno.h>
+#include <fnmatch.h>
 #include <math.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -36,16 +38,31 @@
 #include <X11/Xutil.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/extensions/dpms.h>
+#include <X11/extensions/scrnsaver.h>
 
 #include <GL/gl.h>
 #include <GL/glx.h>
 
-/* messages go to stderr with a "chrysanth: " prefix; die() also exits with status 1 (exit() is noreturn, warn() has the printf format check) */
+/* messages go to stderr with a "chrysanth: " prefix: warn() is for what went wrong, info() for what is merely going on (-q silences it); both have the printf format check.
+   die() also exits with status 1 (exit() is noreturn). */
+static bool quiet; /* -q */
+static void __attribute__((format(printf, 1, 0))) vmsg(const char *fmt, va_list ap) {
+    fputs("chrysanth: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+}
 static void __attribute__((format(printf, 1, 2))) warn(const char *fmt, ...) {
     va_list ap;
-    fputs("chrysanth: ", stderr);
-    va_start(ap, fmt), vfprintf(stderr, fmt, ap), va_end(ap);
-    fputc('\n', stderr);
+    va_start(ap, fmt);
+    vmsg(fmt, ap);
+    va_end(ap);
+}
+static void __attribute__((format(printf, 1, 2))) info(const char *fmt, ...) {
+    va_list ap;
+    if (quiet) return;
+    va_start(ap, fmt);
+    vmsg(fmt, ap);
+    va_end(ap);
 }
 #define die(...) (warn(__VA_ARGS__), exit(1))
 
@@ -61,6 +78,9 @@ static void __attribute__((format(printf, 1, 2))) warn(const char *fmt, ...) {
 #define STALL_MIN_SEC 0.25         /* after a stall a frame's dt is capped at max(this, STALL_PERIODS frame periods) */
 #define STALL_PERIODS 4.0
 #define OPACITY_OPAQUE 0xffffffffUL /* _NET_WM_WINDOW_OPACITY of a fully opaque window */
+#define FPS_MIN 0.01               /* the accepted frame rates (-F): the period 1/fps must stay a sane number of seconds... */
+#define FPS_MAX 1000.0
+#define SPEED_MAX 1e6              /* ...and |speed| (-s) small enough that shader time and the float uniform made from it never overflow */
 
 typedef struct { const char **v; int n; } StrList;
 static void listAdd(StrList *l, const char *item) {
@@ -77,11 +97,12 @@ static bool xerrQuiet;           /* they are expected right now (context probing
 
 static const char *shaderPath, *compositor, *wrapCmd; /* shaderPath: -f, a shader file or a directory of them; wrapCmd: -W, chrysanth re-executes itself under it */
 static const char *fragFile; /* the shader file actually loaded: the candidate that compiled (see resolveShader), reloaded and watched */
-static float speed = 1.0f, scale = 1.0f;
-static double fps = 30.0;
+static double speed = 1.0, scale = 1.0, fps = 30.0; /* doubles, so that no setting can overflow a float on its way in (see checkSettings for the ranges) */
+static double wrapSec; /* -T: shader time goes back to 0 after this many seconds; 0: it never does */
 static StrList pauseExempt; /* -k fullscreen_pause_exceptions: WM_CLASS names whose fullscreen windows are see-through */
 static StrList killComp; /* -K fullscreen_kill_compositor: WM_CLASS names; while one is fullscreen, the compositor is stopped */
-static char compName[64] = "picom"; /* process name of the compositor, taken from -C (see initCompName) */
+static const char *compProc; /* -N: the compositor's process name, when it cannot be guessed from -C */
+static char compName[64] = "picom"; /* the process name -K stops and the already-running check looks for: -N, else guessed from -C (see initCompName); empty: unknown, both are off */
 static bool compAbsent, compKilled; /* -K window up but no compositor running (nothing to restart) / we stopped it and owe it a restart */
 
 static Display *d;
@@ -100,6 +121,8 @@ static bool fbDbl;        /* it is double-buffered: frames are drawn to the fron
 static int rrEvBase;         /* the first event number of the XRandR extension */
 static bool hasRandr, dirtyFs = true, dirtyScreen, fsPaused;
 static bool hasDpms, blanked; /* DPMS is usable / the monitor is blanked (standby, suspend, off) */
+static int ssEvBase;          /* the first event number of the MIT-SCREEN-SAVER extension */
+static bool hasSaver, saverOn; /* it is usable / the X screensaver is on: the idle timeout (xset s) has struck, which is also what xss-lock hears and locks the screen on */
 static double nextDpmsT, nextT; /* monoSec() time of the next DPMS check / at which the next frame is due */
 static unsigned prog;    /* the current shader program */
 static StrList cands;    /* shader files to try, in order */
@@ -122,14 +145,17 @@ static void spawn(const char *cmd) {
     if (fork()) return;
     sigprocmask(SIG_SETMASK, &origMask, NULL); /* a blocked mask and an ignored SIGCHLD both survive exec */
     signal(SIGCHLD, SIG_DFL);
+    setsid(); /* a session and process group of its own: a Ctrl-C or terminal hangup meant for us must not take the compositor down too */
     execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
     _exit(127);
 }
 
-/* X errors are never fatal (windows vanish mid-query, GLX probing may fail): they are counted for the surface and context setup to compare, and the first MAX_XERRORS_SHOWN are printed. */
+/* X errors are never fatal (windows vanish mid-query, GLX probing may fail): they are counted for the surface and context setup to compare, and the first MAX_XERRORS_SHOWN are printed.
+   The exception is BadWindow, the everyday result of asking about a window that has just closed: it is neither counted nor printed. */
 static int onXError(Display *dpy, XErrorEvent *e) {
     static int shown;
     char text[128];
+    if (e->error_code == BadWindow) return 0; /* a window we were asking about has just closed (the active window, mostly): routine, and not worth one of the MAX_XERRORS_SHOWN, which would leave real errors unprinted */
     xerrors++;
     if (xerrQuiet || shown >= MAX_XERRORS_SHOWN) return 0;
     shown++;
@@ -140,7 +166,10 @@ static int onXError(Display *dpy, XErrorEvent *e) {
 
 static void drainSignals(void) {
     struct signalfd_siginfo si;
-    while (read(sfd, &si, sizeof si) == (ssize_t)sizeof si) *(si.ssi_signo == SIGUSR1 ? &reloadFlag : &quitFlag) = true;
+    while (read(sfd, &si, sizeof si) == (ssize_t)sizeof si) {
+        if (si.ssi_signo == SIGUSR1) reloadFlag = true;
+        else quitFlag = true; /* SIGINT, SIGTERM, SIGHUP */
+    }
 }
 
 /* The signals are blocked and read from a signalfd, so one arriving between a flag check and the poll cannot be missed: it just makes the fd readable. */
@@ -209,32 +238,66 @@ static const char *findWord(const char *src, const char *p, const char *word) {
     return NULL;
 }
 
-/* does `src` define `void main`? (`void mainImage(` must not count: it contains "void main") */
+/* blanks the comments of `s` in place: their characters become spaces, newlines stay. What is left can be searched for keywords without matching commented-out
+   code, and every offset and line number is unchanged. */
+static void blankComments(char *s) {
+    for (char *p = s; *p;) {
+        if (p[0] == '/' && p[1] == '/') {
+            while (*p && *p != '\n') *p++ = ' ';
+        } else if (p[0] == '/' && p[1] == '*') {
+            p[0] = p[1] = ' ';
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) {
+                if (*p != '\n') *p = ' ';
+                p++;
+            }
+            if (*p) { p[0] = p[1] = ' '; p += 2; }
+        } else {
+            p++;
+        }
+    }
+}
+
+/* does `src` (comments blanked) define `void main`? (`void mainImage(` must not count: it contains "void main") */
 static bool definesMain(const char *src) {
     for (const char *p = findWord(src, src, "void"); p; p = findWord(src, p + 1, "void")) {
         const char *q = p + 4;
         if (!isspace((unsigned char)*q)) continue;
         while (isspace((unsigned char)*q)) q++;
-        if (!strncmp(q, "main", 4) && !isIdent(q[4])) return 1;
+        if (!strncmp(q, "main", 4) && !isIdent(q[4])) return true;
     }
-    return 0;
+    return false;
 }
 
-/* does `src` already declare `uniform ... name` on some line? `name` must be a whole identifier: `uniform float iTimeDelta;` does not declare iTime */
+/* does `src` (comments blanked) already declare `name` as a uniform? The statement the identifier sits in, back to the previous ; { or } (or the start of the text), must
+   contain the word `uniform`. That covers a declaration split over several lines, and one sharing its line with other code (`uniform float a; float b = iTime;` declares
+   no iTime). `name` must be a whole identifier: `uniform float iTimeDelta;` does not declare iTime. */
 static bool declares(const char *src, const char *name) {
     for (const char *p = findWord(src, src, name); p; p = findWord(src, p + 1, name)) {
-        const char *ls = p;
-        while (ls > src && ls[-1] != '\n') ls--;
-        for (const char *q = ls; q + 7 <= p; q++)
-            if (!strncmp(q, "uniform", 7)) return 1;
+        const char *st = p, *u;
+        while (st > src && !strchr(";{}", st[-1])) st--;
+        u = findWord(st, st, "uniform");
+        if (u && u < p) return true;
     }
-    return 0;
+    return false;
 }
 
-/* plain shaders pass through unchanged; Shadertoy shaders (mainImage, no main) get the Shadertoy uniforms and a main() wrapper */
-static char *prepareFrag(const char *src, bool *toy) {
-    *toy = strstr(src, "mainImage") && !definesMain(src);
-    if (!*toy) return strdup(src);
+/* does `src` (comments blanked) mention iChannel0..3, iChannelTime or iChannelResolution? Shadertoy's texture, buffer and audio inputs are not supported */
+static bool usesChannels(const char *src) {
+    for (const char *p = strstr(src, "iChannel"); p; p = strstr(p + 1, "iChannel"))
+        if (p == src || !isIdent(p[-1])) return true;
+    return false;
+}
+
+/* plain shaders pass through unchanged; Shadertoy shaders (mainImage, no main) get the Shadertoy uniforms and a main() wrapper. *channels: iChannel inputs are used.
+   Everything is looked for in a copy of the source with its comments blanked, so that commented-out code (`// uniform float iTime;`, `// void main`) counts for nothing. */
+static char *prepareFrag(const char *src, bool *toy, bool *channels) {
+    char *scan = strdup(src);
+    if (!scan) die("out of memory");
+    blankComments(scan);
+    *channels = usesChannels(scan);
+    *toy = findWord(scan, scan, "mainImage") && !definesMain(scan);
+    if (!*toy) { free(scan); return strdup(src); }
 
     static const char *tail =
         "\nout vec4 wsFragColor;\n"
@@ -244,8 +307,9 @@ static char *prepareFrag(const char *src, bool *toy) {
         "    wsFragColor = vec4(c.rgb, 1.0);\n"
         "}\n";
 
-    char *body = strdup(src), version[128] = "#version 330 core", *v = strstr(body, "#version");
+    char *body = strdup(src), version[128] = "#version 330 core", *v = strstr(scan, "#version"); /* not one inside a comment */
     if (v) { /* keep the author's version line; blank it in the body so line numbers still match */
+        v = body + (v - scan);
         char *e = strchr(v, '\n');
         size_t n = e ? (size_t)(e - v) : strlen(v);
         snprintf(version, sizeof version, "%.*s", (int)MIN(n, sizeof version - 1), v);
@@ -256,20 +320,21 @@ static char *prepareFrag(const char *src, bool *toy) {
     if (!m) die("out of memory");
     fprintf(m, "%s\n", version);
     for (int i = 0; i < U_COUNT; i++)
-        if (!declares(body, uniDefs[i].name)) fprintf(m, "uniform %s %s;\n", uniDefs[i].type, uniDefs[i].name);
+        if (!declares(scan, uniDefs[i].name)) fprintf(m, "uniform %s %s;\n", uniDefs[i].type, uniDefs[i].name);
     fprintf(m, "#line 1\n%s%s", body, tail);
     fclose(m); /* `out` is valid from here on */
     free(body);
+    free(scan);
     return out;
 }
 
 /* true if shader (or, with isProg, program) `obj` compiled (linked); otherwise prints its log */
 static bool buildOk(unsigned obj, bool isProg, const char *what) {
-    int ok; char log[4096];
+    int ok; char msg[4096];
     (isProg ? glGetProgramiv : glGetShaderiv)(obj, isProg ? GL_LINK_STATUS : GL_COMPILE_STATUS, &ok);
     if (!ok) {
-        (isProg ? glGetProgramInfoLog : glGetShaderInfoLog)(obj, sizeof log, NULL, log);
-        warn("%s failed to %s:\n%s", what, isProg ? "link" : "compile", log);
+        (isProg ? glGetProgramInfoLog : glGetShaderInfoLog)(obj, sizeof msg, NULL, msg);
+        warn("%s failed to %s:\n%s", what, isProg ? "link" : "compile", msg);
     }
     return ok;
 }
@@ -287,10 +352,11 @@ static unsigned compile(const char *src, GLenum type, const char *what) {
 static unsigned buildProgram(const char *path) {
     char *raw = readFile(path);
     if (!raw) return 0;
-    bool toy;
-    char *src = prepareFrag(raw, &toy);
+    bool toy, channels;
+    char *src = prepareFrag(raw, &toy, &channels);
     free(raw);
-    warn("%s: %s shader", path, toy ? "Shadertoy" : "plain");
+    info("%s: %s shader", path, toy ? "Shadertoy" : "plain");
+    if (channels) warn("%s uses iChannel inputs (textures, buffers, audio), which are not supported: expect a build error, or black where they are sampled", path);
 
     unsigned vs = compile(fullscreenVert, GL_VERTEX_SHADER, "vertex shader"), fs = compile(src, GL_FRAGMENT_SHADER, path), p = 0;
     free(src);
@@ -315,7 +381,7 @@ static void setResolution(void) {
 
 /* look up the (current) program's uniforms in one pass over its active ones, and set the constant ones */
 static void bindUniforms(void) {
-    int viaAlias[U_COUNT] = {0};
+    bool viaAlias[U_COUNT] = {false};
     GLint count = 0;
     for (int k = 0; k < U_COUNT; k++) U[k].loc = -1;
     glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &count);
@@ -323,7 +389,7 @@ static void bindUniforms(void) {
         char nm[128]; GLint len, size; GLenum ty;
         glGetActiveUniform(prog, i, sizeof nm, &len, &size, &ty, nm);
         for (int k = 0; k < U_COUNT; k++) {
-            int isAlias = uniDefs[k].alias && !strcmp(nm, uniDefs[k].alias);
+            bool isAlias = uniDefs[k].alias && !strcmp(nm, uniDefs[k].alias);
             if (!isAlias && (strcmp(nm, uniDefs[k].name) || viaAlias[k])) continue; /* the alias wins over the Shadertoy name */
             U[k].loc = glGetUniformLocation(prog, nm);
             U[k].type = ty;
@@ -348,20 +414,28 @@ static void setUniforms(double t, double dt, unsigned long frame) {
             struct tm lt;
             localtime_r(&tt, &lt);
             cachedSec = tt;
-            date[0] = lt.tm_year + 1900, date[1] = lt.tm_mon, date[2] = lt.tm_mday, date[3] = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec;
+            date[0] = lt.tm_year + 1900;
+            date[1] = lt.tm_mon;
+            date[2] = lt.tm_mday;
+            date[3] = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec;
         }
         glUniform4f(U[U_DATE].loc, date[0], date[1], date[2], date[3]);
     }
 }
 
 /* makes np the running program; the old one is deleted (at startup there is none: glDeleteProgram ignores 0) */
-static void useProgram(unsigned np) { glDeleteProgram(prog), glUseProgram(prog = np), bindUniforms(); }
+static void useProgram(unsigned np) {
+    glDeleteProgram(prog);
+    prog = np;
+    glUseProgram(prog);
+    bindUniforms();
+}
 
 static void reloadShader(void) {
     unsigned np = buildProgram(fragFile);
     if (!np) { warn("reload failed, keeping the previous shader"); return; }
     useProgram(np);
-    warn("shader reloaded");
+    info("shader reloaded");
 }
 
 /* shader file watch */
@@ -383,7 +457,7 @@ static void drainWatch(void) {
     while (ino >= 0 && (n = read(ino, buf, sizeof buf)) > 0)
         for (char *p = buf; p < buf + n;) {
             struct inotify_event *e = (struct inotify_event *)p;
-            if (e->len && !strcmp(e->name, watchName)) reloadFlag = 1;
+            if (e->len && !strcmp(e->name, watchName)) reloadFlag = true;
             p += sizeof *e + e->len;
         }
 }
@@ -392,27 +466,32 @@ static void drainWatch(void) {
 /* the root-sized pixmap, wrapped as a GLX pixmap that GL renders into (made current here) */
 static void surfaceCreate(int w, int h) {
     S = (typeof(S)){.w = w, .h = h};
-    S.rw = (int)fmaxf(w * scale + 0.5f, 1); /* a render size of at least 1 pixel */
-    S.rh = (int)fmaxf(h * scale + 0.5f, 1);
+    S.rw = (int)fmax(w * scale + 0.5, 1); /* a render size of at least 1 pixel */
+    S.rh = (int)fmax(h * scale + 0.5, 1);
     S.pm = XCreatePixmap(d, root, w, h, wa.depth);
     int before = xerrors;
     S.gp = glXCreatePixmap(d, fbcfg, S.pm, NULL);
     XSync(d, False);
     if (!S.gp || xerrors != before || !glXMakeCurrent(d, S.gp, ctx)) die("cannot render into the GLX pixmap");
     if (S.rw != w || S.rh != h) { /* below full size: render offscreen, upscale into the pixmap */
-        /* RGB8 is enough (the shader's alpha is always 1.0) and cheaper in memory bandwidth */
+        /* RGB8 is enough (the shader's alpha is always 1.0) and cheaper in memory bandwidth, but GL does not promise that it can be rendered to; RGBA8 it does */
+        static const GLenum formats[] = {GL_RGB8, GL_RGBA8};
+        GLenum status = 0;
         glGenRenderbuffers(1, &S.rb);
-        glBindRenderbuffer(GL_RENDERBUFFER, S.rb);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGB8, S.rw, S.rh);
         glGenFramebuffers(1, &S.fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, S.fbo);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, S.rb);
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) die("framebuffer incomplete");
+        for (int i = 0; i < ARRAY_LEN(formats) && status != GL_FRAMEBUFFER_COMPLETE; i++) {
+            glBindRenderbuffer(GL_RENDERBUFFER, S.rb);
+            glRenderbufferStorage(GL_RENDERBUFFER, formats[i], S.rw, S.rh);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, S.rb);
+            status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        }
+        if (status != GL_FRAMEBUFFER_COMPLETE) die("framebuffer incomplete (status 0x%x)", status);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (fbDbl) glDrawBuffer(GL_FRONT); /* the default framebuffer's draw buffer sticks across binds */
     glViewport(0, 0, S.rw, S.rh); /* viewport state is the context's, not the framebuffer's: it needs setting once per surface */
-    warn("%dx%d, rendering at %dx%d%s", w, h, S.rw, S.rh, S.fbo ? "" : " (no intermediate buffer)");
+    info("%dx%d, rendering at %dx%d%s", w, h, S.rw, S.rh, S.fbo ? "" : " (no intermediate buffer)");
 }
 
 static void surfaceDestroy(void) {
@@ -456,7 +535,7 @@ static void publish(void) {
 /* On a clean exit, copy the last frame into a pixmap that outlives us (RetainPermanent, like Esetroot and feh) and point the root properties at it; the live pixmap
    dies with our connection. The next wallpaper setter, or our next start (takeOverRoot), frees it with XKillClient. */
 static void leaveStill(void) {
-    if (!S.pm) return;
+    if (!S.pm || !S.announced) return; /* nothing was drawn on this surface yet (quit before the first frame, or right after a resize): a new pixmap's contents are undefined, so the wallpaper stays as it is */
     glFinish(); glXWaitGL();
     Pixmap still = XCreatePixmap(d, root, S.w, S.h, wa.depth);
     GC gc = XCreateGC(d, still, 0, NULL);
@@ -474,20 +553,29 @@ static void leaveStill(void) {
    Only when _XROOTPMAP_ID and ESETROOT_PMAP_ID agree (the Esetroot convention): a lone _XROOTPMAP_ID may point at something else. */
 static void takeOverRoot(void) {
     unsigned long v[MAX_PROP_ITEMS], e[MAX_PROP_ITEMS];
-    if (getProp(root, A[A_ROOTPMAP], XA_PIXMAP, v) == 1 && getProp(root, A[A_ESETPMAP], XA_PIXMAP, e) == 1 && v[0] && v[0] == e[0])
-        (xerrQuiet = true, XKillClient(d, v[0]), XSync(d, False), xerrQuiet = false); /* a stale id (owner already gone) answers BadValue: expected, not worth printing */
-    XDeleteProperty(d, root, A[A_ROOTPMAP]); XDeleteProperty(d, root, A[A_ESETPMAP]);
+    if (getProp(root, A[A_ROOTPMAP], XA_PIXMAP, v) == 1 && getProp(root, A[A_ESETPMAP], XA_PIXMAP, e) == 1 && v[0] && v[0] == e[0]) {
+        xerrQuiet = true; /* a stale id (owner already gone) answers BadValue: expected, not worth printing */
+        XKillClient(d, v[0]);
+        XSync(d, False);
+        xerrQuiet = false;
+    }
+    XDeleteProperty(d, root, A[A_ROOTPMAP]);
+    XDeleteProperty(d, root, A[A_ESETPMAP]);
     XSync(d, False);
 }
 
 /* window rules */
+/* is `s` one of the items of `l`? An item with a * or ? in it is a glob pattern (fnmatch, so `\` quotes: `\[x\]*` matches "[x] ..."); any other item must match exactly.
+   Patterns are for the names that vary: Steam's WM_CLASS steam_app_*, or a title that carries a document name or a score. */
 static bool inList(const StrList *l, const char *s) {
-    for (int k = 0; s && k < l->n; k++)
-        if (!strcmp(s, l->v[k])) return 1;
-    return 0;
+    for (int k = 0; s && k < l->n; k++) {
+        const char *item = l->v[k];
+        if (strpbrk(item, "*?") ? !fnmatch(item, s, 0) : !strcmp(item, s)) return true;
+    }
+    return false;
 }
 
-/* does the window's WM_CLASS (instance or class name) or, with `withTitle`, its title (_NET_WM_NAME, or the legacy WM_NAME) equal one of the items of `l`? */
+/* does the window's WM_CLASS (instance or class name) or, with `withTitle`, its title (_NET_WM_NAME, or the legacy WM_NAME) match one of the items of `l` (see inList)? */
 static bool matches(Window win, const StrList *l, bool withTitle) {
     if (!l->n) return false;
     bool hit = false;
@@ -522,7 +610,7 @@ static int fullscreenState(Window win) {
     Window r, child;
     int x, y, rx, ry;
     unsigned ww, hh, bw, depth;
-    int covers = XGetGeometry(d, win, &r, &x, &y, &ww, &hh, &bw, &depth) && XTranslateCoordinates(d, win, root, 0, 0, &rx, &ry, &child) &&
+    bool covers = XGetGeometry(d, win, &r, &x, &y, &ww, &hh, &bw, &depth) && XTranslateCoordinates(d, win, root, 0, 0, &rx, &ry, &child) &&
                  rx <= 0 && ry <= 0 && rx + (int)ww >= S.w && ry + (int)hh >= S.h;
     return !covers ? FS_NO : onKillList ? FS_KILL : FS_PAUSE;
 }
@@ -548,26 +636,45 @@ static int findProcs(const char *name, pid_t *pids, int max) {
     return n;
 }
 
-/* Commands that may precede the real one, with their single-letter options that take a value (env: `-u NAME`, nice: a bare `-n N`; `-i`, `-N`, `--adjustment=N` etc. take none). */
-static const struct { const char *name, *valOpts; } wrappers[] = {{"env", "uCS"}, {"nice", "n"}};
+/* Commands that may precede the real one, with their single-letter options that take a value as the next word (env: `-u NAME`, nice: a bare `-n N`, systemd-run: `-p PROP`;
+   `-i`, `-N`, `--adjustment=N`, `--user` etc. take none). A long option with a separate value (`--unit foo`) is not understood: that is what -N is for. */
+static const struct { const char *name, *valOpts; } wrappers[] = {
+    {"env", "uCS"}, {"nice", "n"}, {"setsid", ""}, {"nohup", ""}, {"prime-run", ""}, {"systemd-run", "HMuEp"},
+};
 
-/* The process that -K stops is the one the -C command starts: its first word (after leading VAR=value words, env [options], exec and nice [options]),
-   without the directory and cut to the COMM_LEN characters of a /proc comm name. With no -C command, picom. */
+/* Shells are never a compositor's process name: `-C "sh -c '...'"` says nothing about the real one, and -K would stop every shell of the user's. */
+static bool isShell(const char *name) {
+    static const char *const shells[] = {"sh", "bash", "dash", "ash", "ksh", "mksh", "zsh", "fish", "csh", "tcsh"};
+    for (int i = 0; i < ARRAY_LEN(shells); i++)
+        if (!strcmp(name, shells[i])) return true;
+    return false;
+}
+
+/* The process that -K stops (and that the already-running check looks for) is the one -N names or, failing that, the one the -C command starts: its first word
+   (after leading VAR=value words and the wrappers above, exec included), without the directory and cut to the COMM_LEN characters of a /proc comm name.
+   With neither, picom. A shell is refused (see isShell): the name is then empty, which switches -K and the check off. */
 /* the word at or after p (blanks skipped): its length goes to *n */
 static const char *nextWord(const char *p, size_t *n) { p += strspn(p, " \t"); *n = strcspn(p, " \t"); return p; }
 
 static void initCompName(void) {
     size_t n = 0;
-    const char *p = compositor ? nextWord(compositor, &n) : NULL;
+    const char *p = compositor && !compProc ? nextWord(compositor, &n) : NULL;
+    if (compProc) { /* -N may be a path, too: the process name is its last part */
+        const char *slash = strrchr(compProc, '/');
+        snprintf(compName, sizeof compName, "%.*s", COMM_LEN, slash ? slash + 1 : compProc);
+    }
     while (p && n) {
-        const char *vals = NULL;
-        bool skip = p[strcspn(p, "= \t")] == '=' || (n == 4 && !strncmp(p, "exec", 4)); /* VAR=value, exec */
-        for (int i = 0; i < ARRAY_LEN(wrappers); i++)
-            if (n == strlen(wrappers[i].name) && !strncmp(p, wrappers[i].name, n)) skip = true, vals = wrappers[i].valOpts;
+        const char *slash = memrchr(p, '/', n), *base = slash ? slash + 1 : p, *vals = NULL; /* /usr/bin/env is env */
+        size_t bn = (size_t)(p + n - base);
+        bool skip = p[strcspn(p, "= \t")] == '=' || (bn == 4 && !strncmp(base, "exec", 4)); /* VAR=value, exec */
+        for (int i = 0; i < ARRAY_LEN(wrappers); i++) {
+            if (bn != strlen(wrappers[i].name) || strncmp(base, wrappers[i].name, bn)) continue;
+            skip = true;
+            vals = wrappers[i].valOpts;
+        }
         if (!skip) { /* the command itself */
-            const char *slash = memrchr(p, '/', n), *base = slash ? slash + 1 : p;
-            snprintf(compName, sizeof compName, "%.*s", (int)MIN(COMM_LEN, p + n - base), base);
-            return;
+            snprintf(compName, sizeof compName, "%.*s", (int)MIN(COMM_LEN, bn), base);
+            break;
         }
         p = nextWord(p + n, &n);
         while (vals && n && *p == '-') { /* a wrapper's options (VAR=value words are skipped by the next rounds) */
@@ -576,34 +683,46 @@ static void initCompName(void) {
             if (takesArg) p = nextWord(p + n, &n);
         }
     }
+    if (isShell(compName)) {
+        warn("'%s' is a shell, not the compositor: its process name is unknown, so -K and the already-running check are off (name it with -N, e.g. -N picom)", compName);
+        compName[0] = 0;
+    }
 }
 
 /* stop the compositor while a -K window is fullscreen, restart it afterwards: only one that was really running, and not if one is running again by then. */
 static void setCompositor(bool stop) {
+    static bool told; /* the "nothing to stop" notice is given once, not at every -K window */
     pid_t pids[16];
     if (!stop) compAbsent = false;
     if (stop && !compKilled && !compAbsent) {
-        int n = findProcs(compName, pids, ARRAY_LEN(pids));
-        if (!n) { compAbsent = true; return; }
+        int n = compName[0] ? findProcs(compName, pids, ARRAY_LEN(pids)) : 0;
+        if (!n) {
+            compAbsent = true;
+            if (!told && compName[0]) warn("-K window is fullscreen, but no process named '%s' of yours is running: nothing to stop (is that the compositor's name? see -N)", compName);
+            if (!told && !compName[0]) warn("-K window is fullscreen, but the compositor's process name is unknown: nothing to stop (see -N)");
+            told = true;
+            return;
+        }
         for (int i = 0; i < n; i++) kill(pids[i], SIGTERM);
         for (int i = 0; i < COMP_EXIT_TRIES && findProcs(compName, pids, 1); i++) poll(NULL, 0, COMP_EXIT_POLL_MS); /* a restart must not race its shutdown */
         compKilled = true;
-        warn("-K window is fullscreen, stopped %s", compName);
+        info("-K window is fullscreen, stopped %s", compName);
     } else if (!stop && compKilled) {
         compKilled = false;
-        if (findProcs(compName, pids, 1)) { warn("%s is running again, not restarting it", compName); return; }
-        const char *cmd = compositor ? compositor : "picom";
+        if (findProcs(compName, pids, 1)) { info("%s is running again, not restarting it", compName); return; }
+        const char *cmd = compositor ? compositor : compProc ? compProc : "picom"; /* with no -C: the process -N names, else picom */
         spawn(cmd);
-        warn("restarting %s: %s", compName, cmd);
+        info("restarting %s: %s", compName, cmd);
     }
 }
 
-/* The -C command starts at the earliest safe moment: after the stale root pixmap is gone (so the compositor cannot latch onto a dead one), without waiting for
-   GL, the shader build or the first frame; publish() later makes it pick the wallpaper up. One that is already running (a re-exec, say) is left alone. */
+/* The -C command starts once the first shader has built and the stale root pixmap is gone (see main): the compositor cannot latch onto a dead pixmap, and a broken
+   shader never costs the running instance its wallpaper; publish() later makes the compositor pick the new one up. One that is already running (a re-exec,
+   say) is left alone, when its name is known. */
 static void startCompositor(void) {
     pid_t running;
     if (!compositor) return;
-    if (findProcs(compName, &running, 1)) warn("%s is already running, not starting it", compName);
+    if (compName[0] && findProcs(compName, &running, 1)) info("%s is already running, not starting it", compName);
     else spawn(compositor);
 }
 
@@ -611,6 +730,7 @@ static void startCompositor(void) {
 static void updateFullscreen(void) {
     unsigned long v[MAX_PROP_ITEMS];
     Window win = getProp(root, A[A_ACTIVE], XA_WINDOW, v) == 1 ? v[0] : 0;
+    if (win == root) win = 0; /* a window manager may name the root when nothing has focus: XSelectInput on it would replace our PropertyChangeMask from initEvents, and clear it again when the focus moves on */
     if (win != watched) { /* follow the active window so its state changes wake us up */
         if (watched) XSelectInput(d, watched, 0);
         if ((watched = win)) XSelectInput(d, win, PropertyChangeMask | StructureNotifyMask);
@@ -633,12 +753,12 @@ static void updateScreen(void) {
 /* is the monitor blanked by DPMS? There is no event for it in Xlib, so it is polled. */
 static bool screenBlanked(void) { CARD16 level; BOOL on; return hasDpms && DPMSInfo(d, &level, &on) && on && level != DPMSModeOn; }
 
-/* a blank monitor needs no frames: looked at once per DPMS_POLL_SEC, and not while a fullscreen window pauses us anyway */
+/* a blank monitor needs no frames: looked at once per DPMS_POLL_SEC, and not while a fullscreen window or the screensaver pauses us anyway */
 static void updateBlanked(double now) {
-    if (fsPaused || now < nextDpmsT) return;
+    if (fsPaused || saverOn || now < nextDpmsT) return;
     nextDpmsT = now + DPMS_POLL_SEC;
     bool off = screenBlanked();
-    if (off != blanked) warn("monitor %s", off ? "blanked, pausing" : "on again");
+    if (off != blanked) info("monitor %s", off ? "blanked, pausing" : "on again");
     blanked = off;
 }
 
@@ -651,14 +771,28 @@ static void pumpEvents(void) {
             if (ev.xproperty.window == root ? a == A[A_ACTIVE] : (a == A[A_STATE] || a == A[A_OPACITY] || a == XA_WM_CLASS || a == XA_WM_NAME || a == A[A_NETNAME])) dirtyFs = true;
         } else if (ev.type == ConfigureNotify || ev.type == DestroyNotify) dirtyFs = true; /* the active window moved, resized or went away */
         else if (hasRandr && ev.type == rrEvBase + RRScreenChangeNotify) { XRRUpdateConfiguration(&ev); dirtyScreen = true; }
+        else if (hasSaver && ev.type == ssEvBase + ScreenSaverNotify) {
+            int st = ((XScreenSaverNotifyEvent *)&ev)->state;
+            bool on = st == ScreenSaverOn || st == ScreenSaverCycle;
+            if (on != saverOn) info("screensaver %s", on ? "on, pausing" : "off");
+            saverOn = on;
+        }
     }
 }
 
-/* subscribe to what wakes us up (root properties for the active window, XRandR changes, edits of the shader file) and probe DPMS */
+/* subscribe to what wakes us up (root properties for the active window, XRandR changes, the screensaver, edits of the shader file) and probe DPMS.
+   The screensaver extension reports the server's idle timeout (and a saver client's window), which is also what xss-lock locks on; a locker started by hand
+   (i3lock from a key binding) is neither: its override-redirect window never becomes the active window, and only DPMS blanking ends the rendering behind it. */
 static void initEvents(void) {
-    int rrErr, dpmsEv, dpmsErr;
+    int rrErr, dpmsEv, dpmsErr, ssErr;
     XSelectInput(d, root, PropertyChangeMask);
     if ((hasRandr = XRRQueryExtension(d, &rrEvBase, &rrErr))) XRRSelectInput(d, root, RRScreenChangeNotifyMask);
+    if ((hasSaver = XScreenSaverQueryExtension(d, &ssEvBase, &ssErr))) {
+        XScreenSaverInfo *si = XScreenSaverAllocInfo();
+        XScreenSaverSelectInput(d, root, ScreenSaverNotifyMask);
+        saverOn = si && XScreenSaverQueryInfo(d, root, si) && si->state == ScreenSaverOn; /* it may already be on when we start */
+        if (si) XFree(si);
+    }
     setupWatch(fragFile);
     hasDpms = DPMSQueryExtension(d, &dpmsEv, &dpmsErr) && DPMSCapable(d);
 }
@@ -710,7 +844,7 @@ static void pickConfig(VisualID rootVisual) {
         GLXFBConfig c = all[i];
         if (!(cfgAttr(c, GLX_DRAWABLE_TYPE) & GLX_PIXMAP_BIT) || !(cfgAttr(c, GLX_RENDER_TYPE) & GLX_RGBA_BIT) || cfgAttr(c, GLX_SAMPLE_BUFFERS)) continue;
         XVisualInfo *vi = glXGetVisualFromFBConfig(d, c);
-        int fits = vi && vi->depth == wa.depth, isRoot = fits && vi->visualid == rootVisual;
+        bool fits = vi && vi->depth == wa.depth, isRoot = fits && vi->visualid == rootVisual;
         if (vi) XFree(vi);
         int score = 4 * !cfgAttr(c, GLX_DOUBLEBUFFER) + 2 * (!cfgAttr(c, GLX_DEPTH_SIZE) && !cfgAttr(c, GLX_STENCIL_SIZE)) + isRoot;
         if (fits && score > best) { best = score; fbcfg = c; }
@@ -718,7 +852,7 @@ static void pickConfig(VisualID rootVisual) {
     if (all) XFree(all);
     if (!fbcfg) die("no GLX framebuffer config can render into a pixmap of the root's depth");
     fbDbl = cfgAttr(fbcfg, GLX_DOUBLEBUFFER);
-    warn("GLX config 0x%x (%s)", cfgAttr(fbcfg, GLX_FBCONFIG_ID), fbDbl ? "double-buffered, front buffer" : "single-buffered");
+    info("GLX config 0x%x (%s)", cfgAttr(fbcfg, GLX_FBCONFIG_ID), fbDbl ? "double-buffered, front buffer" : "single-buffered");
 }
 
 /* GL up: config, context, surface, the first shader that builds (a broken file in a shader directory just moves on to the next), vertex array, uniforms */
@@ -746,22 +880,28 @@ static const struct { char opt; const char *key, *arg, *help; } options[] = {
     {0, NULL, NULL, "Shader config"},
     {'s', "speed", "x", "Animation speed multiplier (default 1)"},
     {'r', "scale", "x", "Render scale [0.N - 1] (default 1)."},
-    {'F', "fps", "n", "Target fps (default 30)"},
+    {'F', "fps", "n", "Target fps, 0.01 - 1000 (default 30)"},
+    {'T', "time_wrap", "n", "Wrap shader time back to 0 every n seconds (default: never). A float uniform gets coarse as time grows (steps of 15 ms after 1.5 days, 60 ms after 6); wrapping avoids that, but jumps unless the shader is periodic in n"},
     {0, NULL, NULL, "Window rules"},
-    {'k', "fullscreen_pause_exceptions", "class", "Fullscreen pause exceptions: these windows don't pause the shader (comma-separated)"},
-    {'K', "fullscreen_kill_compositor", "name", "Fullscreen kill compositor: windows whose WM_CLASS or title (WM_NAME) matches; while one is fullscreen the compositor is stopped, and restarted after (comma-separated)"},
-    {'C', "compositor", "cmd", "Compositor command: run at startup and after -K; its first word is the process -K stops (default: picom)"},
+    {'k', "fullscreen_pause_exceptions", "class", "Fullscreen pause exceptions: these windows don't pause the shader (comma-separated; * and ? are wildcards)"},
+    {'K', "fullscreen_kill_compositor", "name", "Fullscreen kill compositor: windows whose WM_CLASS or title (WM_NAME) matches; while one is fullscreen the compositor is stopped, and restarted after (comma-separated; * and ? are wildcards)"},
+    {'C', "compositor", "cmd", "Compositor command: run at startup and after -K; its first word is the process -K stops, unless -N says otherwise (default: picom)"},
+    {'N', "compositor_process", "name", "Compositor process name: what -K stops and the already-running check looks for. Needed when -C starts a shell or a wrapper chrysanth does not know"},
     {0, NULL, NULL, "Program options"},
     {'W', "wrapper", "cmd", "Run chrysanth itself under `env cmd`, e.g. \"DRI_PRIME=1\" or \"prime-run\" (config key: wrapper)"},
     {'c', NULL, "file", "Config file specified (default: ~/.config/chrysanth/chrysanth.conf, else next to binary)"},
+    {'q', NULL, "", "Quiet: print only warnings and errors"},
     {'h', NULL, "", "What you're just reading right now... (also --help)"},
 };
 
 /* config file */
+static char *settingSrc[128]; /* by option letter: where the setting's value came from ("-r", or "scale in chrysanth.conf"), for the range errors of checkSettings */
+static const char *srcOf(char opt) { return settingSrc[(int)opt] ? settingSrc[(int)opt] : "setting"; }
+
 static double parseNum(const char *s, const char *opt) {
     char *end;
     double v = strtod(s, &end);
-    if (end == s || *end) die("bad number for %s: %s", opt, s);
+    if (end == s || *end || !isfinite(v)) die("bad number for %s: %s", opt, s); /* "nan" and "inf" parse as numbers, too: they would freeze time or make the frame period 0 */
     return v;
 }
 static char *trim(char *s) { /* in place: drops blanks at both ends */
@@ -799,16 +939,30 @@ static void addCsv(StrList *l, char *val) {
 
 /* The only place settings are interpreted, from the config file or the command line (`opt` is the option letter). `val` may be modified; `what` names the setting in errors. */
 static void setOption(int opt, char *val, const char *what) {
+    free(settingSrc[opt]);
+    settingSrc[opt] = strdup(what);
     switch (opt) {
     case 'f': shaderPath = expandHome(val); break;
-    case 's': speed = (float)parseNum(val, what); break;
-    case 'r': scale = (float)parseNum(val, what); break;
+    case 's': speed = parseNum(val, what); break;
+    case 'r': scale = parseNum(val, what); break;
     case 'F': fps = parseNum(val, what); break;
+    case 'T': wrapSec = parseNum(val, what); break;
+    case 'q': quiet = true; break;
     case 'k': addCsv(&pauseExempt, val); break;
     case 'K': addCsv(&killComp, val); break;
     case 'C': compositor = strdup(val); break;
+    case 'N': compProc = strdup(val); break;
     case 'W': wrapCmd = strdup(val); break;
     }
+}
+
+/* The ranges are checked once everything is read, so that a bad value in the config file can still be overridden on the command line; the messages name where the
+   value came from. (A number that is not one at all, or not finite, is refused at once by parseNum.) */
+static void checkSettings(void) {
+    if (!(scale > 0 && scale <= 1)) die("%s must be in (0, 1], not %g", srcOf('r'), scale);
+    if (!(fps >= FPS_MIN && fps <= FPS_MAX)) die("%s must be in [%g, %g], not %g", srcOf('F'), FPS_MIN, FPS_MAX, fps);
+    if (!(fabs(speed) <= SPEED_MAX)) die("%s must be in [-%g, %g], not %g", srcOf('s'), SPEED_MAX, SPEED_MAX, speed);
+    if (!(wrapSec >= 0)) die("%s must not be negative, not %g", srcOf('T'), wrapSec);
 }
 
 /* Config file: `key = value` per line (see chrysanth.conf, README.md). Read before the command line, which overrides single values and adds to the lists. A NULL path does nothing. */
@@ -816,7 +970,9 @@ static void loadConfig(const char *path, bool mustExist) {
     FILE *f = path ? fopen(path, "r") : NULL;
     if (!f && path && mustExist) die("%s: %s", path, strerror(errno));
     if (!f) return;
-    warn("config: %s", path);
+    info("config: %s", path);
+    const char *base = strrchr(path, '/'); /* the file's own name is what the messages quote: the start of a long path says nothing */
+    base = base ? base + 1 : path;
     char *line = NULL; size_t cap = 0;
     for (int ln = 1; getline(&line, &cap, f) > 0; ln++) {
         char *s = trim(line), *eq = strchr(s, '=');
@@ -829,7 +985,7 @@ static void loadConfig(const char *path, bool mustExist) {
         for (int i = 0; i < ARRAY_LEN(options); i++)
             if (options[i].key && !strcmp(key, options[i].key)) opt = options[i].opt;
         if (!opt) { warn("%s:%d: unknown key '%s'", path, ln, key); continue; }
-        snprintf(what, sizeof what, "%.40s in %.15s", key, path);
+        snprintf(what, sizeof what, "%.40s in %.15s", key, base);
         setOption(opt, val, what);
     }
     free(line);
@@ -847,13 +1003,21 @@ static ssize_t exePath(char *buf, size_t size) { /* this binary's path, NUL-term
 static char *defaultConfigPath(void) {
     const char *xdg = getenv("XDG_CONFIG_HOME"), *exeDir = NULL;
     char exe[EXE_PATH_MAX], *slash, *found = NULL;
-    if (exePath(exe, sizeof exe) > 0 && (slash = strrchr(exe, '/'))) *slash = 0, exeDir = exe;
+    if (exePath(exe, sizeof exe) > 0 && (slash = strrchr(exe, '/'))) {
+        *slash = 0;
+        exeDir = exe;
+    }
     struct { const char *fmt, *dir; } cand[] = {{"%s/chrysanth/chrysanth.conf", xdg}, {"%s/chrysanth.conf", exeDir}}; /* in order of preference */
-    if (!(xdg && *xdg)) cand[0].fmt = "%s/.config/chrysanth/chrysanth.conf", cand[0].dir = getenv("HOME");
+    if (!(xdg && *xdg)) {
+        cand[0].fmt = "%s/.config/chrysanth/chrysanth.conf";
+        cand[0].dir = getenv("HOME");
+    }
     for (int i = 0; i < ARRAY_LEN(cand) && !found; i++) {
         char *p = NULL;
-        if (cand[i].dir && *cand[i].dir && asprintf(&p, cand[i].fmt, cand[i].dir) >= 0)
-            found = access(p, R_OK) ? (free(p), NULL) : p;
+        if (cand[i].dir && *cand[i].dir && asprintf(&p, cand[i].fmt, cand[i].dir) >= 0) {
+            if (access(p, R_OK)) free(p);
+            else found = p;
+        }
     }
     return found;
 }
@@ -879,18 +1043,18 @@ static void resolveShader(void) {
     srandom((unsigned)time(NULL) ^ ((unsigned)getpid() << 16));
     int j = (int)(random() % cands.n);
     const char *tmp = cands.v[0]; cands.v[0] = cands.v[j]; cands.v[j] = tmp;
-    warn("%s: %d shader%s, starting with %s", shaderPath, cands.n, cands.n == 1 ? "" : "s", cands.v[0]);
+    info("%s: %d shader%s, starting with %s", shaderPath, cands.n, cands.n == 1 ? "" : "s", cands.v[0]);
 }
 
 /* The wrapper setting: re-execute ourselves as `env <wrapper> <this binary> <same args>`, so things like DRI_PRIME=1 (or prime-run, nice -n 10, ...) are in place
    before any GL/X work happens. CHRYSANTH_WRAPPED marks the second run, which skips this (it reads the same config and would otherwise loop). */
 static void applyWrapper(int argc, char **argv) {
-    if (getenv("CHRYSANTH_WRAPPED")) { unsetenv("CHRYSANTH_WRAPPED"); return; } /* not inherited by -x/-P children */
+    if (getenv("CHRYSANTH_WRAPPED")) { unsetenv("CHRYSANTH_WRAPPED"); return; } /* not inherited by the compositor or anything else we start */
     if (!wrapCmd) return;
     char exe[EXE_PATH_MAX], *script = NULL;
     if (exePath(exe, sizeof exe) <= 0 || asprintf(&script, "exec env %s \"$@\"", wrapCmd) < 0) die("cannot apply wrapper");
     argv[0] = exe;
-    warn("wrapper: env %s", wrapCmd);
+    info("wrapper: env %s", wrapCmd);
     setenv("CHRYSANTH_WRAPPED", "1", 1);
     /* sh -c script sh exe args...: "$@" is exe plus the original arguments */
     char *nv[argc + 5];
@@ -922,19 +1086,24 @@ static void readSettings(int argc, char **argv) {
     for (int i = 0; i < ARRAY_LEN(options); i++)
         if (options[i].opt) o += sprintf(o, "%c%s", options[i].opt, *options[i].arg ? ":" : "");
 
-    /* the config file is read first so the command line can override it, so -c has to be found before the real option pass */
+    /* the config file is read first so the command line can override it, so -c has to be found before the real option pass. -h and -q are acted on here too: the
+       "config:" notice must obey -q, and a broken config file must not get in the way of the help. */
     const char *cfgPath = NULL;
     opterr = 0;
-    for (int c; (c = getopt_long(argc, argv, optString, longOpts, NULL)) != -1;) if (c == 'c') cfgPath = optarg;
+    for (int c; (c = getopt_long(argc, argv, optString, longOpts, NULL)) != -1;) {
+        if (c == 'c') cfgPath = optarg;
+        else if (c == 'q') quiet = true;
+        else if (c == 'h') { usage(stdout, true); exit(0); }
+    }
     opterr = 1;
     optind = 0; /* 0, not 1: makes glibc and musl start over, including their argv reordering state */
     char *defPath = cfgPath ? NULL : defaultConfigPath();
-    loadConfig(cfgPath ? cfgPath : defPath, cfgPath != NULL), free(defPath);
+    loadConfig(cfgPath ? cfgPath : defPath, cfgPath != NULL);
+    free(defPath);
 
     for (int c; (c = getopt_long(argc, argv, optString, longOpts, NULL)) != -1;) {
         switch (c) {
-        case 'c': break; /* handled above */
-        case 'h': usage(stdout, true); exit(0);
+        case 'c': case 'h': break; /* handled above */
         case '?': usage(stderr, false); exit(1);
         default: setOption(c, optarg, (char[]){'-', (char)c, 0}); /* every other option is a setting */
         }
@@ -945,17 +1114,20 @@ static void readSettings(int argc, char **argv) {
 /* main */
 int main(int argc, char **argv) {
     readSettings(argc, argv);
-    initCompName();
     applyWrapper(argc, argv);
+    initCompName(); /* after the wrapper's re-exec, so that its notice is printed once */
     resolveShader();
-    if (!(scale > 0.0f && scale <= 1.0f)) die("-r must be in (0, 1]");
-    if (!(fps > 0.0)) die("-F must be positive");
+    checkSettings();
 
     setupSignals();
     openDisplay();
     takeOverRoot();
-    startCompositor();
+    // VVV possibly outdated comment now? swapped initGL with takeOverRoot to fix a bug
+    /* Whatever a bad shader can make fail comes before the running instance is touched: a typo or a compile error exits here, and the wallpaper it was showing stays.
+       Only then does the stale root pixmap go (takeOverRoot) and the compositor start, so that it cannot latch onto a dead one; the first publish() makes it pick
+       up the new wallpaper. The price: the compositor starts one GL setup and shader build later than it used to. */
     initGL();
+    startCompositor();
     initEvents();
 
     /* running shader time is accumulated frame by frame, so a pause simply adds nothing */
@@ -973,13 +1145,14 @@ int main(int argc, char **argv) {
         double now = monoSec();
         updateBlanked(now);
         /* paused: block until an X event, a file change or a signal (blank: also the next DPMS check); the first frame after is due at once */
-        if (fsPaused || blanked) { lastNow = -1; nextT = 0; waitEvents(fsPaused ? -1 : nextDpmsT); continue; }
+        if (fsPaused || saverOn || blanked) { lastNow = -1; nextT = 0; waitEvents(fsPaused || saverOn ? -1 : nextDpmsT); continue; }
         /* not due yet: sleep, but wake for events and reloads */
         if (now < nextT) { waitEvents(nextT); continue; }
 
         double period = 1.0 / fps, dt = lastNow < 0 ? period : now - lastNow;
         dt = fmin(dt, fmax(STALL_MIN_SEC, STALL_PERIODS * period)); /* after a stall the animation goes on, it doesn't jump */
         shaderT += dt * speed;
+        if (wrapSec > 0 && fabs(shaderT) >= wrapSec) shaderT = fmod(shaderT, wrapSec); /* -T: keeps the float uniform fine-grained on a wallpaper that runs for weeks */
         lastNow = now;
         renderFrame(shaderT, dt, frameNo++);
         publish();
